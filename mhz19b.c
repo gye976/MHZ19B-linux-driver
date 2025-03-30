@@ -337,7 +337,7 @@ static int mhz19b_probe(struct serdev_device *serdev)
 }
 
 static const struct of_device_id mhz19b_of_match[] = {
-    { .compatible = "mhz19b", },
+    { .compatible = "winsen,mhz19b", },
     {   }
 };
 
