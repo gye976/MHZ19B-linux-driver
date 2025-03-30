@@ -1,0 +1,8 @@
+/dts-v1/;
+/plugin/;
+
+&uart1 {
+    mhz19b: mhz19b-co2-sensor {
+	    compatible = "winsen,mhz19b";
+    };
+};
