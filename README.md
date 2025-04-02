@@ -8,11 +8,11 @@ Datasheet: https://www.winsen-sensor.com/d/files/infrared-gas-sensor/mh-z19b-co2
 
 ## Usage:
 ```bash
-$ cat /sys/bus/iio/devices/iio\:device0/in_concentration_co2_input 
+$ cat /sys/bus/iio/devices/iio\:device0/in_concentration_co2_raw 
 1139
-$ cat /sys/bus/iio/devices/iio\:device0/in_concentration_co2_input 
+$ cat /sys/bus/iio/devices/iio\:device0/in_concentration_co2_raw 
 1137
-$ cat /sys/bus/iio/devices/iio\:device0/in_concentration_co2_input 
+$ cat /sys/bus/iio/devices/iio\:device0/in_concentration_co2_raw
 1137
 ...
 
