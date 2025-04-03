@@ -3,6 +3,12 @@
  * mh-z19b co2 sensor driver
  *
  * Copyright (c) 2025 Gyeyoung Baek <gye976@gmail.com>
+ *
+ * Datasheet:
+ * https://www.winsen-sensor.com/d/files/infrared-gas-sensor/mh-z19b-co2-ver1_0.pdf
+ *
+ * TODO:
+ *  - vin supply regulator
  */
 
 #include <linux/cleanup.h>
@@ -27,8 +33,9 @@ struct mhz19b_state {
 	struct regulator *vin_supply;
 
 	/* serdev receive buffer.
-	* When data is received from the MH-Z19B,
-	* the 'mhz19b_receive_buf' callback function is called and fills this buffer.*/
+	 * When data is received from the MH-Z19B,
+	 * the 'mhz19b_receive_buf' callback function is called and fills this buffer.
+	 */
 	char buf[9];
 	int buf_idx;
 
@@ -40,23 +47,25 @@ struct mhz19b_state {
 };
 
 /*
- * * commands have following format:
+ * commands have following format:
  *
  * +------+------+-----+------+------+------+------+------+-------+
  * | 0xFF | 0x01 | cmd | arg0 | arg1 | 0x00 | 0x00 | 0x00 | cksum |
  * +------+------+-----+------+------+------+------+------+-------+
-*/
+ *
+ * The following commands are defined in the datasheet.
+ * https://www.winsen-sensor.com/d/files/infrared-gas-sensor/mh-z19b-co2-ver1_0.pdf
+ */
 #define MHZ19B_CMD_SIZE 9
 
-/* The following commands are defined in the datasheet. 
- * https://www.winsen-sensor.com/d/files/infrared-gas-sensor/mh-z19b-co2-ver1_0.pdf */
-
-/* ABC logic in MHZ19B means auto calibration. */
 #define MHZ19B_ABC_LOGIC_CMD		0x79
 #define MHZ19B_READ_CO2_CMD		0x86
 #define MHZ19B_ZERO_POINT_CMD		0x87
 #define MHZ19B_SPAN_POINT_CMD		0x88
 #define MHZ19B_DETECTION_RANGE_CMD	0x99
+
+/* ABC logic in MHZ19B means auto calibration.
+ */
 
 #define MHZ19B_SERDEV_TIMEOUT	msecs_to_jiffies(100)
 
@@ -114,7 +123,7 @@ static int mhz19b_serdev_cmd(struct iio_dev *indio_dev,
 			dev_err(dev, "write err, %d bytes written", ret);
 			return -EINVAL;
 		}
-		
+
 		switch (cmd) {
 		case MHZ19B_READ_CO2_CMD:
 			ret = wait_for_completion_interruptible_timeout(&st->buf_ready,
@@ -123,7 +132,7 @@ static int mhz19b_serdev_cmd(struct iio_dev *indio_dev,
 				return ret;
 			if (!ret)
 				return -ETIMEDOUT;
-			
+
 			ret = mhz19b_get_checksum(st->buf);
 			if (st->buf[MHZ19B_CMD_SIZE - 1] != mhz19b_get_checksum(st->buf)) {
 				dev_err(dev, "checksum err");
@@ -176,8 +185,10 @@ static IIO_DEVICE_ATTR_WO(calibration_auto_enable, 0);
 
 /* write 0		: zero point calibration_auto_enable
  *	(make sure the sensor had been worked under 400ppm for over 20 minutes.)
- * write 1000~5000	: span point calibration: 
- *	(make sure the sensor had been worked under a certain level co2 for over 20 minutes.) */
+ *
+ * write 1000-5000	: span point calibration:
+ *	(make sure the sensor had been worked under a certain level co2 for over 20 minutes.)
+ */
 static ssize_t calibration_forced_value_store(struct device *dev,
 	struct device_attribute *attr,
 	const char *buf, size_t len)
@@ -215,7 +226,8 @@ static IIO_CONST_ATTR(calibration_forced_value_available,
 static IIO_DEVICE_ATTR_WO(calibration_forced_value, 0);
 
 /* MH-Z19B supports a measurement range adjustment feature.
- * It can measure up to 2000 ppm or up to 5000 ppm. */
+ * It can measure up to 2000 ppm or up to 5000 ppm.
+ */
 static ssize_t co2_range_store(struct device *dev,
 	struct device_attribute *attr,
 	const char *buf, size_t len)
@@ -289,7 +301,8 @@ static int mhz19b_receive_buf(struct serdev_device *serdev, const unsigned char 
 }
 
 /* The 'serdev_device_write' function returns -EINVAL if the 'write_wakeup' member is NULL,
- * so it must be mandatory. */
+ * so it must be mandatory.
+ */
 static void mhz19b_write_wakeup(struct serdev_device *serdev)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(&serdev->dev);
@@ -315,9 +328,11 @@ static int mhz19b_probe(struct serdev_device *serdev)
 	if (ret)
 		return ret;
 
-	serdev_device_set_baudrate(serdev, 9600);
+	ret = serdev_device_set_baudrate(serdev, 9600);
+	if (ret < 0)
+		return ret;
 
-	/* This is void type func. */
+	/* void type func, no return */
 	serdev_device_set_flow_control(serdev, false);
 
 	ret = serdev_device_set_parity(serdev, SERDEV_PARITY_NONE);
@@ -337,7 +352,10 @@ static int mhz19b_probe(struct serdev_device *serdev)
 	if (ret)
 		return ret;
 
-	/* TO DO: vin supply */
+	/* TO DO:
+	 *  - vin supply
+	 */
+
 	indio_dev->name = "mh-z19b";
 	indio_dev->channels = mhz19b_channels;
 	indio_dev->num_channels = ARRAY_SIZE(mhz19b_channels);
