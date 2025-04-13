@@ -6,9 +6,6 @@
  *
  * Datasheet:
  * https://www.winsen-sensor.com/d/files/infrared-gas-sensor/mh-z19b-co2-ver1_0.pdf
- *
- * TODO:
- *  - vin supply regulator
  */
 
 #include <linux/cleanup.h>
@@ -23,16 +20,15 @@
 #include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
 #include <linux/serdev.h>
-//#include <linux/unaligned.h>
-#include <asm-generic/unaligned.h> // TODO
+#include <asm-generic/unaligned.h>
+//#include <linux/unaligned.h> // TODO
 
 struct mhz19b_state {
 	struct serdev_device *serdev;
+	struct regulator *vin;
 
-	/* TO DO, nothing for now.*/
-	struct regulator *vin_supply;
-
-	/* serdev receive buffer.
+	/* 
+	 * serdev receive buffer. 
 	 * When data is received from the MH-Z19B,
 	 * the 'mhz19b_receive_buf' callback function is called and fills this buffer.
 	 */
@@ -41,9 +37,6 @@ struct mhz19b_state {
 
 	/* must wait the 'buf' is filled with 9 bytes.*/
 	struct completion buf_ready;
-
-	/* protect access to mhz19b_state */
-	struct mutex lock;
 };
 
 /*
@@ -52,20 +45,20 @@ struct mhz19b_state {
  * +------+------+-----+------+------+------+------+------+-------+
  * | 0xFF | 0x01 | cmd | arg0 | arg1 | 0x00 | 0x00 | 0x00 | cksum |
  * +------+------+-----+------+------+------+------+------+-------+
- *
- * The following commands are defined in the datasheet.
- * https://www.winsen-sensor.com/d/files/infrared-gas-sensor/mh-z19b-co2-ver1_0.pdf
  */
 #define MHZ19B_CMD_SIZE 9
 
 #define MHZ19B_ABC_LOGIC_CMD		0x79
 #define MHZ19B_READ_CO2_CMD		0x86
-#define MHZ19B_ZERO_POINT_CMD		0x87
 #define MHZ19B_SPAN_POINT_CMD		0x88
-#define MHZ19B_DETECTION_RANGE_CMD	0x99
+#define MHZ19B_ZERO_POINT_CMD		0x87
 
-/* ABC logic in MHZ19B means auto calibration.
- */
+#define MHZ19B_ABC_LOGIC_OFF_CKSUM	0x86
+#define MHZ19B_ABC_LOGIC_ON_CKSUM	0xE6
+#define MHZ19B_READ_CO2_CKSUM		0x79
+#define MHZ19B_ZERO_POINT_CKSUM		0x78
+
+/* ABC logic in MHZ19B means auto calibration. */
 
 #define MHZ19B_SERDEV_TIMEOUT	msecs_to_jiffies(100)
 
@@ -85,12 +78,15 @@ static uint8_t mhz19b_get_checksum(uint8_t *packet)
 static int mhz19b_serdev_cmd(struct iio_dev *indio_dev,
 	int cmd, void *arg)
 {
-	int ret = 0;
 	struct mhz19b_state *st = iio_priv(indio_dev);
 	struct serdev_device *serdev = st->serdev;
 	struct device *dev = &indio_dev->dev;
+	int ret;
 
-	/* commands format is described above. */
+	/* 
+	 * cmd_buf[3,4] : arg0,1
+	 * cmd_buf[8] : checksum 
+	 */
 	uint8_t cmd_buf[MHZ19B_CMD_SIZE] = {
 		0xFF, 0x01, cmd,
 	};
@@ -99,52 +95,59 @@ static int mhz19b_serdev_cmd(struct iio_dev *indio_dev,
 	case MHZ19B_ABC_LOGIC_CMD: {
 		bool enable = *((bool *)arg);
 
-		cmd_buf[3] = enable ? 0xA0 : 0x00;
+		if (enable) {
+			cmd_buf[3] = 0xA0;
+			cmd_buf[8] = MHZ19B_ABC_LOGIC_ON_CKSUM;
+		} else {
+			cmd_buf[3] = 0;
+			cmd_buf[8] = MHZ19B_ABC_LOGIC_OFF_CKSUM;
+		}
+		break;
+	} case MHZ19B_READ_CO2_CMD: {
+		cmd_buf[8] = MHZ19B_READ_CO2_CKSUM;
 		break;
 	} case MHZ19B_SPAN_POINT_CMD: {
 		uint16_t ppm = *((uint16_t *)arg);
 
 		put_unaligned_be16(ppm, &cmd_buf[3]);
+		cmd_buf[MHZ19B_CMD_SIZE - 1] = mhz19b_get_checksum(cmd_buf);
 		break;
-	} case MHZ19B_DETECTION_RANGE_CMD: {
-		uint16_t range = *((uint16_t *)arg);
-
-		put_unaligned_be16(range, &cmd_buf[3]);
+	} case MHZ19B_ZERO_POINT_CMD: {
+		cmd_buf[8] = MHZ19B_ZERO_POINT_CKSUM;	
 		break;
 	} default:
 		break;
 	}
-	cmd_buf[MHZ19B_CMD_SIZE - 1] = mhz19b_get_checksum(cmd_buf);
 
-	scoped_guard(mutex, &st->lock) {
-		/* write buf to uart ctrl syncronously */
-		ret = serdev_device_write(serdev, cmd_buf, MHZ19B_CMD_SIZE, 0);
-		if (ret != MHZ19B_CMD_SIZE) {
-			dev_err(dev, "write err, %d bytes written", ret);
+	/* write buf to uart ctrl syncronously */
+	ret = serdev_device_write(serdev, cmd_buf, MHZ19B_CMD_SIZE, 0);
+	if (ret != MHZ19B_CMD_SIZE) {
+		dev_err(dev, "write err, %d bytes written", ret);
+		return -EINVAL;
+	}
+
+	switch (cmd) {
+	case MHZ19B_READ_CO2_CMD:
+		ret = wait_for_completion_interruptible_timeout(&st->buf_ready,
+			MHZ19B_SERDEV_TIMEOUT);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			return -ETIMEDOUT;
+
+		ret = mhz19b_get_checksum(st->buf);
+		if (st->buf[MHZ19B_CMD_SIZE - 1] != mhz19b_get_checksum(st->buf)) {
+			dev_err(dev, "checksum err");
 			return -EINVAL;
 		}
 
-		switch (cmd) {
-		case MHZ19B_READ_CO2_CMD:
-			ret = wait_for_completion_interruptible_timeout(&st->buf_ready,
-				MHZ19B_SERDEV_TIMEOUT);
-			if (ret < 0)
-				return ret;
-			if (!ret)
-				return -ETIMEDOUT;
-
-			ret = mhz19b_get_checksum(st->buf);
-			if (st->buf[MHZ19B_CMD_SIZE - 1] != mhz19b_get_checksum(st->buf)) {
-				dev_err(dev, "checksum err");
-				return -EINVAL;
-			}
-
-			ret = get_unaligned_be16(&st->buf[2]);
-			return ret;
-		default:
-			/* no response commands. */
-			return 0;
-		}
+		ret = get_unaligned_be16(&st->buf[2]);
+		return ret;
+		break;
+	default:
+		/* no response commands. */
+		return 0;
+		break;
 	}
 }
 
@@ -169,9 +172,7 @@ static ssize_t calibration_auto_enable_store(struct device *dev,
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	bool enable;
-
 	int ret = kstrtobool(buf, &enable);
-
 	if (ret)
 		return ret;
 
@@ -183,10 +184,11 @@ static ssize_t calibration_auto_enable_store(struct device *dev,
 }
 static IIO_DEVICE_ATTR_WO(calibration_auto_enable, 0);
 
-/* write 0		: zero point calibration_auto_enable
+/* 
+ * write 0		: zero point calibration_auto_enable
  *	(make sure the sensor had been worked under 400ppm for over 20 minutes.)
  *
- * write 1000-5000	: span point calibration:
+ * write [1000 1 5000]	: span point calibration:
  *	(make sure the sensor had been worked under a certain level co2 for over 20 minutes.)
  */
 static ssize_t calibration_forced_value_store(struct device *dev,
@@ -195,10 +197,9 @@ static ssize_t calibration_forced_value_store(struct device *dev,
 {
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	uint16_t ppm;
-	int cmd;
+	int cmd, ret;
 
-	int ret = kstrtou16(buf, 10, &ppm);
-
+	ret = kstrtou16(buf, 10, &ppm);
 	if (ret)
 		return ret;
 
@@ -221,48 +222,11 @@ static ssize_t calibration_forced_value_store(struct device *dev,
 
 	return len;
 }
-static IIO_CONST_ATTR(calibration_forced_value_available,
-	"0 1000-5000");
 static IIO_DEVICE_ATTR_WO(calibration_forced_value, 0);
 
-/* MH-Z19B supports a measurement range adjustment feature.
- * It can measure up to 2000 ppm or up to 5000 ppm.
- */
-static ssize_t co2_range_store(struct device *dev,
-	struct device_attribute *attr,
-	const char *buf, size_t len)
-{
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	int ret;
-	uint16_t range;
-
-	ret = kstrtou16(buf, 10, &range);
-	if (ret)
-		return ret;
-
-	/* Detection Range should be 2000 or 5000 */
-	if (!(range == 2000 || range == 5000)) {
-		dev_dbg(&indio_dev->dev, "detection range should be 2000 or 5000");
-		return -EINVAL;
-	}
-
-
-	ret = mhz19b_serdev_cmd(indio_dev, MHZ19B_DETECTION_RANGE_CMD, &range);
-	if (ret < 0)
-		return ret;
-
-	return len;
-}
-static IIO_CONST_ATTR(co2_range_available,
-	"2000 5000");
-static IIO_DEVICE_ATTR_WO(co2_range, 0);
-
 static struct attribute *mhz19b_attrs[] = {
-	&iio_const_attr_calibration_forced_value_available.dev_attr.attr,
-	&iio_const_attr_co2_range_available.dev_attr.attr,
 	&iio_dev_attr_calibration_auto_enable.dev_attr.attr,
 	&iio_dev_attr_calibration_forced_value.dev_attr.attr,
-	&iio_dev_attr_co2_range.dev_attr.attr,
 	NULL
 };
 
@@ -284,7 +248,7 @@ static const struct iio_chan_spec mhz19b_channels[] = {
 	},
 };
 
-static int mhz19b_receive_buf(struct serdev_device *serdev, const unsigned char *data, size_t len) // TODO
+static int mhz19b_receive_buf(struct serdev_device *serdev, const unsigned char *data, size_t len)
 {
 	struct iio_dev *indio_dev = dev_get_drvdata(&serdev->dev);
 	struct mhz19b_state *st = iio_priv(indio_dev);
@@ -300,19 +264,9 @@ static int mhz19b_receive_buf(struct serdev_device *serdev, const unsigned char 
 	return len;
 }
 
-/* The 'serdev_device_write' function returns -EINVAL if the 'write_wakeup' member is NULL,
- * so it must be mandatory.
- */
-static void mhz19b_write_wakeup(struct serdev_device *serdev)
-{
-	struct iio_dev *indio_dev = dev_get_drvdata(&serdev->dev);
-
-	dev_dbg(&indio_dev->dev, "mhz19b_write_wakeup");
-}
-
 static const struct serdev_device_ops mhz19b_ops = {
 	.receive_buf = mhz19b_receive_buf,
-	.write_wakeup = mhz19b_write_wakeup,
+	.write_wakeup = serdev_device_write_wakeup,
 };
 
 static int mhz19b_probe(struct serdev_device *serdev)
@@ -332,7 +286,6 @@ static int mhz19b_probe(struct serdev_device *serdev)
 	if (ret < 0)
 		return ret;
 
-	/* void type func, no return */
 	serdev_device_set_flow_control(serdev, false);
 
 	ret = serdev_device_set_parity(serdev, SERDEV_PARITY_NONE);
@@ -340,7 +293,7 @@ static int mhz19b_probe(struct serdev_device *serdev)
 		return ret;
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(struct mhz19b_state));
-	if (indio_dev == NULL)
+	if (!indio_dev)
 		return ret;
 	dev_set_drvdata(dev, indio_dev);
 
@@ -348,23 +301,29 @@ static int mhz19b_probe(struct serdev_device *serdev)
 	st->serdev = serdev;
 
 	init_completion(&st->buf_ready);
-	ret = devm_mutex_init(dev, &st->lock);
+
+	st->vin = devm_regulator_get(dev, "vin");
+	if (IS_ERR(st->vin))
+		return PTR_ERR(st->vin);
+
+	ret = regulator_enable(st->vin);
 	if (ret)
 		return ret;
-
-	/* TO DO:
-	 *  - vin supply
-	 */
-
+		
 	indio_dev->name = "mh-z19b";
 	indio_dev->channels = mhz19b_channels;
 	indio_dev->num_channels = ARRAY_SIZE(mhz19b_channels);
 	indio_dev->info = &mhz19b_info;
-	ret = devm_iio_device_register(dev, indio_dev);
-	if (ret)
-		return ret;
 
-	return 0;
+	return devm_iio_device_register(dev, indio_dev);
+}
+
+static void mhz19b_remove(struct serdev_device *serdev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(&serdev->dev);
+	struct mhz19b_state *st = iio_priv(indio_dev);
+
+	regulator_disable(st->vin);
 }
 
 static const struct of_device_id mhz19b_of_match[] = {
@@ -379,6 +338,7 @@ static struct serdev_device_driver mhz19b_driver = {
 		.of_match_table = mhz19b_of_match,
 	},
 	.probe = mhz19b_probe,
+	.remove = mhz19b_remove,
 };
 module_serdev_device_driver(mhz19b_driver);
 
